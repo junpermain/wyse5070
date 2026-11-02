@@ -1,0 +1,79 @@
+name: build-wyse5070
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'Linux 内核版本（如 6.12.115）'
+        required: true
+        default: '6.12.115'
+
+env:
+  KVER: ${{ github.event.inputs.kernel_version || '6.12.115' }}
+
+jobs:
+  kernel:
+    name: 编译内核
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            xz-utils cpio kmod rsync zstd
+
+      - name: 编译 bzImage + 模块
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/build-kernel.sh
+
+      - name: 上传内核产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel
+          path: dist/*
+          if-no-files-found: error
+
+      - name: 记录版本
+        run: echo "kernel=$KVER" >> "$GITHUB_STEP_SUMMARY"
+
+  image:
+    name: 打包可启动镜像
+    needs: kernel
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取回内核产物
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel
+          path: dist
+
+      - name: 安装打包依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            e2fsprogs dosfstools parted mtools \
+            grub-efi-amd64-bin grub-common
+
+      - name: 生成镜像
+        run: |
+          chmod +x scripts/*.sh
+          sudo ./scripts/build-image.sh
+
+      - name: 上传镜像
+        uses: actions/upload-artifact@v4
+        with:
+          name: wyse5070-image
+          path: out/*.img.gz
+          if-no-files-found: error
