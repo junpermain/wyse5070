@@ -2,6 +2,7 @@
 # 用 dist/ 里编好的内核 + Alpine minirootfs 打一个可启动镜像
 # 用法: sudo ./scripts/build-image.sh
 set -euo pipefail
+export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
 
 if [ "$EUID" -ne 0 ]; then
   echo "需要 root 运行（挂载 loop 设备）: sudo $0"; exit 1
@@ -53,6 +54,7 @@ curl -fL --retry 3 -o "$BUILD/alpine.tar.gz" "$ALPINE_BASE/$FILE"
 tar xzf "$BUILD/alpine.tar.gz" -C "$BUILD/root"
 
 echo "==> 放入内核模块"
+mkdir -p "$BUILD/root/lib/modules" "$BUILD/root/boot"
 tar -C "$BUILD/root/lib/modules" -xzf "$MODTAR"
 
 echo "==> 放入内核与脚本"
