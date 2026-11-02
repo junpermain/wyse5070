@@ -139,3 +139,20 @@ CONFIG_MY_DRIVER=y
 - 没有 initramfs，所以 `CONFIG_SATA_AHCI` / `CONFIG_BLK_DEV_SD` / `CONFIG_EXT4_FS` 必须保持 `=y`
 - 冒烟测试只证明「能引导」，不证明 `i915` 硬解和 Waydroid 可用 —— 那需要真显卡，得在实机验
 - 想改成「装到硬盘」而不是 U 盘：把 `build-image.sh` 里的 `--removable --no-nvram` 去掉并写入 NVRAM，或保留 removable 直接把镜像 dd 到硬盘（本方案天然支持，硬盘走同一条 UEFI 路径）
+
+## 已实测修复的坑（2026-11-02，n100 全链路验证）
+
+1. **Alpine 3.24+ minirootfs 不再自带 openrc**（inittab 却仍引用 /sbin/openrc），
+   不补装会卡在 `can't run '/sbin/openrc'`。build-image.sh 已在解包后
+   `chroot apk add openrc`，并断言 /sbin/openrc 落位。
+2. **grub-install --removable 的 prefix 指向 ESP 上的 /EFI/BOOT**，
+   grub.cfg 必须同时放 ESP 和 /boot/grub，否则真机掉进 rescue shell。
+3. **不要在内核命令行设 loglevel<6**：启动横幅、EXT4 挂载、命令行回显都是
+   info 级，设低会把这些证据全部吞掉（冒烟测试依赖它们判定启动成功）。
+4. OVMF 的 OVMF_CODE_*.fd 是纯代码段，QEMU 里必须走 pflash 双盘
+   （code + 可写 VARS 副本），不能用 -bios——smoke-boot.sh 已自动处理。
+5. verify-image.sh / smoke-boot.sh 尊重 TMPDIR；在 /tmp 太小的机器上
+   `env TMPDIR=/path/big bash scripts/...` 即可。
+
+### 实测通过的启动链
+UEFI(OVMF) → GRUB 2.12 → Linux 6.12.115 → ext4 root 挂载 → busybox init → OpenRC 服务启动

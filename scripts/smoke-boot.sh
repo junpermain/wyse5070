@@ -22,8 +22,19 @@ find_ovmf() {
   return 1
 }
 OVMF=$(find_ovmf) || { echo "!! 找不到 OVMF 固件，装一下 ovmf 包"; exit 1; }
+# OVMF_CODE_* 是纯代码段，必须走 pflash（code + vars 双盘）；只有整包 OVMF.fd 才能用 -bios
+VARS_TMPL=""
+for v in "${OVMF%_CODE*}_VARS"* "/usr/share/OVMF/OVMF_VARS_4M.fd" "/usr/share/OVMF/OVMF_VARS.fd" "/usr/share/OVMF/OVMF_VARS.ms.fd"; do
+  [ -f "$v" ] && { VARS_TMPL="$v"; break; }
+done
+BIOS_ARGS=()
+if [ -n "$VARS_TMPL" ]; then
+  BIOS_ARGS=("pflash:$OVMF:$VARS_TMPL")
+else
+  BIOS_ARGS=("bios:$OVMF")
+fi
 
-WORK=$(mktemp -d /tmp/smoke.XXXXXX)
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/smoke.XXXXXX")
 IMG="$WORK/img"; LOG="$WORK/serial.log"
 QPID=""
 cleanup() {
@@ -36,12 +47,25 @@ trap cleanup EXIT
 echo "==> 解压镜像"
 zcat "$IMG_GZ" > "$IMG"
 
+# 组装固件参数：pflash 需要一份可写的 VARS 副本
+case "${BIOS_ARGS[0]}" in
+  pflash:*)
+    IFS=: read -r _ CODE VARS <<< "${BIOS_ARGS[0]}"
+    cp "$VARS" "$WORK/vars.fd"
+    BIOS_ARGS=(-drive "if=pflash,format=raw,readonly=on,file=$CODE" \
+               -drive "if=pflash,format=raw,file=$WORK/vars.fd")
+    ;;
+  bios:*)
+    BIOS_ARGS=(-bios "${BIOS_ARGS[0]#bios:}")
+    ;;
+esac
+
 echo "==> QEMU 启动（OVMF: $OVMF，最长 ${MAX_WAIT}s）"
 qemu-system-x86_64 \
   -machine pc -cpu max -m 1024 \
   -display none -monitor none -no-reboot -no-shutdown \
   -serial "file:$LOG" \
-  -bios "$OVMF" \
+  "${BIOS_ARGS[@]}" \
   -drive "file=$IMG,format=raw,if=ide,index=0" \
   -net none &
 QPID=$!

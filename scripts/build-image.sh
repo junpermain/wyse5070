@@ -61,6 +61,15 @@ FILE=$(curl -fsSL "$ALPINE_BASE/latest-releases.yaml" \
 curl -fL --retry 3 -o "$BUILD/alpine.tar.gz" "$ALPINE_BASE/$FILE"
 tar xzf "$BUILD/alpine.tar.gz" -C "$BUILD/root"
 
+# Alpine 3.24+ 的 minirootfs 不再自带 openrc（inittab 却仍引用 /sbin/openrc），
+# 不补装的话开机卡在 "can't run '/sbin/openrc'"
+echo "==> 补装 openrc（新版 minirootfs 已移除）"
+cp -L /etc/resolv.conf "$BUILD/root/etc/resolv.conf" 2>/dev/null || true
+chroot "$BUILD/root" /sbin/apk add --no-cache openrc >/dev/null 2>&1 \
+  || { echo "!! apk add openrc 失败"; exit 1; }
+rm -f "$BUILD/root/etc/resolv.conf"
+[ -e "$BUILD/root/sbin/openrc" ] || { echo "!! openrc 未落位"; exit 1; }
+
 echo "==> 放入内核模块"
 mkdir -p "$BUILD/root/lib/modules" "$BUILD/root/boot"
 tar -C "$BUILD/root/lib/modules" -xzf "$MODTAR"

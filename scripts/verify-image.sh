@@ -9,7 +9,7 @@ if [ -z "$IMG_GZ" ] || [ ! -f "$IMG_GZ" ]; then
   echo "用法: sudo $0 <path/to/*.img.gz>"; exit 1
 fi
 
-WORK=$(mktemp -d /tmp/verify.XXXXXX)
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/verify.XXXXXX")
 ROOT="$WORK/root"; ESP="$WORK/esp"; LOOP=""
 cleanup() {
   set +e
@@ -71,7 +71,7 @@ if [ -n "${KVER:-}" ]; then
 fi
 
 echo "==> 6/6 用户空间"
-[ -f "$ROOT/usr/bin/apk" ]        || fail "没有 /usr/bin/apk，rootfs 不是 Alpine"
+{ [ -f "$ROOT/usr/bin/apk" ] || [ -f "$ROOT/sbin/apk" ]; } || fail "没有 apk，rootfs 不是 Alpine"
 [ -e "$ROOT/sbin/init" ]          || fail "没有 /sbin/init，起不来"
 [ -f "$ROOT/root/setup/alpine-setup.sh" ] || fail "缺首启脚本 /root/setup/alpine-setup.sh"
 ok "Alpine rootfs + init + 首启脚本"
