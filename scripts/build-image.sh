@@ -93,19 +93,22 @@ Wyse 5070 IPTV 镜像
 首启请执行:  sh /root/setup/alpine-setup.sh
 EOF
 
-echo "==> 安装 GRUB (UEFI, removable)"
-grub-install --target=x86_64-efi \
-  --efi-directory="$BUILD/root/boot/efi" \
-  --boot-directory="$BUILD/root/boot" \
-  --removable --no-nvram --no-floppy >/dev/null 2>&1
-
-# --removable 装出来的 BOOTX64.EFI 内嵌 prefix 指向 ESP 上的 /EFI/BOOT，
-# 所以 grub.cfg 必须同时放到 ESP，否则真机上是直接掉进 rescue shell。
+# 不用 grub-install：发行版签名版 grub 的内嵌引导逻辑不统一
+#   （Ubuntu 的会先 search /.disk/info 找不到就掉 shell，Debian 的行为又不同），
+# 用 grub-mkstandalone 把带 UUID 的完整 grub.cfg 直接嵌进 EFI 二进制，
+# 任何发行版上打出来的镜像引导行为都一致，也不依赖 ESP 上有没有配置文件。
 mkdir -p "$BUILD/root/boot/grub" "$BUILD/root/boot/efi/EFI/BOOT"
 sed -e "s|__ROOT_PARTUUID__|$ROOT_PARTUUID|g" \
     -e "s|__ROOT_FSUUID__|$ROOT_FSUUID|g" "$REPO/configs/grub.cfg" \
   > "$BUILD/root/boot/grub/grub.cfg"
 cp "$BUILD/root/boot/grub/grub.cfg" "$BUILD/root/boot/efi/EFI/BOOT/grub.cfg"
+
+echo "==> 生成独立 GRUB EFI (grub-mkstandalone)"
+grub-mkstandalone -O x86_64-efi \
+  -o "$BUILD/root/boot/efi/EFI/BOOT/BOOTX64.EFI" \
+  --modules="part_gpt part_msdos ext2 fat linux search search_fs_uuid search_label normal configfile echo test boot gzio all_video" \
+  "boot/grub/grub.cfg=$BUILD/root/boot/grub/grub.cfg"
+[ -s "$BUILD/root/boot/efi/EFI/BOOT/BOOTX64.EFI" ] || { echo "!! BOOTX64.EFI 生成失败"; exit 1; }
 
 echo "==> 卸载并压缩"
 sync
