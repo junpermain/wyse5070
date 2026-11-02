@@ -1,8 +1,10 @@
 name: build-wyse5070
 
+# push 到 main 自动构建；打 tag（v*）自动出 Release；也可以手动指定内核版本
 on:
   push:
     branches: [main]
+    tags: ['v*']
     paths-ignore:
       - '**.md'
   workflow_dispatch:
@@ -12,25 +14,67 @@ on:
         required: true
         default: '6.12.115'
 
+# 同一分支连推两次时掐掉上一次没跑完的，省额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  KVER: ${{ github.event.inputs.kernel_version || '6.12.115' }}
+  DEFAULT_KVER: '6.12.115'
 
 jobs:
+  # ------------------------------------------------------------------ 内核
   kernel:
     name: 编译内核
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    outputs:
+      kver: ${{ steps.meta.outputs.kver }}
+      sha: ${{ steps.meta.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+
+      - id: meta
+        name: 解析版本与提交号
+        run: |
+          kver="${{ github.event.inputs.kernel_version || env.DEFAULT_KVER }}"
+          # 合法性检查，别把奇怪字符串拼进下载地址
+          case "$kver" in *[!0-9.]*|'') echo "非法内核版本: $kver"; exit 1 ;; esac
+          echo "kver=$kver" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "- 内核版本: \`$kver\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 安装编译依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
-            xz-utils cpio kmod rsync zstd
+            xz-utils cpio kmod rsync zstd ccache
+
+      # 源码包跟内核版本绑定，命中后每次省一分多钟下载
+      - name: 缓存内核源码包
+        uses: actions/cache@v4
+        with:
+          path: build/kernel/linux-*.tar.xz
+          key: ksrc-${{ steps.meta.outputs.kver }}
+
+      # 提速大头：只改片段里一两项时，绝大部分目标文件直接复用
+      - name: 缓存 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ steps.meta.outputs.kver }}-${{ hashFiles('configs/kernel-fragment.config') }}-${{ steps.meta.outputs.sha }}
+          restore-keys: |
+            ccache-${{ steps.meta.outputs.kver }}-${{ hashFiles('configs/kernel-fragment.config') }}-
+            ccache-${{ steps.meta.outputs.kver }}-
+            ccache-
 
       - name: 编译 bzImage + 模块
+        env:
+          KVER: ${{ steps.meta.outputs.kver }}
+          CCACHE: '1'
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          STRICT: '1'          # 关键配置缺一项就直接失败
         run: |
           chmod +x scripts/*.sh
           ./scripts/build-kernel.sh
@@ -39,14 +83,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kernel
-          path: dist/*
+          path: dist
           if-no-files-found: error
 
-      - name: 记录版本
-        run: echo "kernel=$KVER" >> "$GITHUB_STEP_SUMMARY"
-
+  # ------------------------------------------------------------------ 镜像
   image:
-    name: 打包可启动镜像
+    name: 打包镜像 + 结构自检
     needs: kernel
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -59,17 +101,32 @@ jobs:
           name: kernel
           path: dist
 
+      - name: 确认产物层级没被打平
+        run: |
+          ls -l dist
+          ls dist/bzImage-*        >/dev/null || { echo "dist 里没有 bzImage"; exit 1; }
+          ls dist/modules-*.tar.gz >/dev/null || { echo "dist 里没有模块包"; exit 1; }
+
       - name: 安装打包依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            e2fsprogs dosfstools parted mtools \
-            grub-efi-amd64-bin grub-common
+            e2fsprogs dosfstools parted mtools util-linux \
+            grub-efi-amd64-bin grub-common gzip
 
       - name: 生成镜像
+        env:
+          GIT_SHA: ${{ needs.kernel.outputs.sha }}
         run: |
           chmod +x scripts/*.sh
-          sudo ./scripts/build-image.sh
+          # 用 env 显式带过去，避免 sudo 的 env_reset 把 GIT_SHA 吃掉
+          sudo env GIT_SHA="$GIT_SHA" ./scripts/build-image.sh
+
+      - name: 结构自检（gzip / ESP / PARTUUID / 模块 / rootfs）
+        env:
+          KVER: ${{ needs.kernel.outputs.kver }}
+        run: |
+          sudo env KVER="$KVER" ./scripts/verify-image.sh "$(ls out/wyse5070-*.img.gz | head -1)"
 
       - name: 上传镜像
         uses: actions/upload-artifact@v4
@@ -77,3 +134,87 @@ jobs:
           name: wyse5070-image
           path: out/*.img.gz
           if-no-files-found: error
+
+      - name: 汇总
+        run: |
+          f=$(ls out/wyse5070-*.img.gz | head -1)
+          {
+            echo ""
+            echo "## 构建产物"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 内核 | \`${{ needs.kernel.outputs.kver }}\` |"
+            echo "| 提交 | \`${{ needs.kernel.outputs.sha }}\` |"
+            echo "| 镜像 | \`$(basename "$f")\` |"
+            echo "| 大小 | $(du -h "$f" | cut -f1) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------- QEMU 冒烟启动
+  smoke:
+    name: QEMU 冒烟启动
+    needs: [kernel, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取回镜像
+        uses: actions/download-artifact@v4
+        with:
+          name: wyse5070-image
+          path: out
+
+      - name: 安装 QEMU 与 UEFI 固件
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf gzip
+
+      - name: 引导一次，确认能进 init
+        env:
+          KVER: ${{ needs.kernel.outputs.kver }}
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/smoke-boot.sh "$(ls out/wyse5070-*.img.gz | head -1)"
+
+      # 启动日志留档，真机不亮时可以直接对照
+      - name: 保留串口日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-serial-log
+          path: /tmp/smoke.*/serial.log
+          if-no-files-found: ignore
+          retention-days: 15
+
+  # ------------------------------------------------------- tag 才出 Release
+  release:
+    name: 发布到 Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [kernel, image, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取回全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+
+      - name: 整理文件
+        run: |
+          mkdir -p upload
+          find release -type f \( -name '*.img.gz' -o -name 'bzImage-*' \
+              -o -name 'modules-*.tar.gz' -o -name 'kernel-config-*' \) \
+            -exec cp {} upload/ \;
+          ls -lh upload
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" upload/* \
+            --title "Wyse 5070/3040 IPTV 镜像 ${GITHUB_REF_NAME}（内核 ${{ needs.kernel.outputs.kver }}）" \
+            --generate-notes

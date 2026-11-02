@@ -48,6 +48,7 @@ scripts/kconfig/merge_config.sh -m .config "$FRAG" >/dev/null
 make ARCH=x86_64 olddefconfig >/dev/null
 
 echo "==> 校验关键项"
+MISSING=()
 for opt in CONFIG_ANDROID_BINDERFS CONFIG_ANDROID_BINDER_IPC CONFIG_NF_NAT \
            CONFIG_IP_NF_TARGET_MASQUERADE CONFIG_DRM_I915 CONFIG_SND_HDA_CODEC_HDMI \
            CONFIG_R8169 CONFIG_MMC_SDHCI_ACPI CONFIG_USB_XHCI_HCD CONFIG_BLK_DEV_SD \
@@ -55,22 +56,44 @@ for opt in CONFIG_ANDROID_BINDERFS CONFIG_ANDROID_BINDER_IPC CONFIG_NF_NAT \
   val=$(grep -E "^${opt}=" .config | head -1 || true)
   if [ -z "$val" ]; then
     echo "   [缺失] $opt"
+    MISSING+=("$opt")
   else
     echo "   $val"
   fi
 done
+# STRICT=1（CI 用）：缺一项就退出，别浪费二十分钟编出一个跑不起来的盘
+if [ "${STRICT:-0}" = "1" ] && [ ${#MISSING[@]} -gt 0 ]; then
+  echo "!! 关键配置缺失: ${MISSING[*]}"
+  echo "!! 先看 configs/kernel-fragment.config 里这一项的依赖是否没满足"
+  exit 1
+fi
 
 echo "==> 编译 bzImage + 模块 (-j$JOBS)"
-make ARCH=x86_64 -j"$JOBS" bzImage modules
+# 可选 ccache：CI 上靠它把"只改了片段里一两项"的重编压到几分钟
+MAKE_ARGS=()
+if [ "${CCACHE:-0}" = "1" ]; then
+  command -v ccache >/dev/null || { echo "!! 要求 CCACHE=1 但没装 ccache"; exit 1; }
+  ccache -M 2G >/dev/null 2>&1 || true
+  ccache -z >/dev/null 2>&1 || true
+  MAKE_ARGS=("CC=ccache gcc" "HOSTCC=ccache gcc")
+  echo "    ccache 已启用"
+fi
+make ARCH=x86_64 -j"$JOBS" "${MAKE_ARGS[@]}" bzImage modules
 
 echo "==> 安装模块到临时目录"
 rm -rf "$WORK/modules"
-make ARCH=x86_64 INSTALL_MOD_PATH="$WORK/modules" modules_install >/dev/null
+make ARCH=x86_64 "${MAKE_ARGS[@]}" INSTALL_MOD_PATH="$WORK/modules" modules_install >/dev/null
+
+if [ "${CCACHE:-0}" = "1" ]; then
+  echo "==> ccache 统计"
+  ccache -s | sed 's/^/    /'
+fi
 
 mkdir -p "$DIST"
 cp arch/x86/boot/bzImage "$DIST/bzImage-${KVER}"
 cp .config "$DIST/kernel-config-${KVER}"
 tar -C "$WORK/modules/lib/modules" -czf "$DIST/modules-${KVER}.tar.gz" "${KVER}"
 
+# 片段里被 olddefconfig 丢掉的项，会在这里现原形（CI 里直接判失败）
 echo "==> 产物:"
 ls -lh "$DIST"

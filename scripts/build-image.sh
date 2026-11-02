@@ -21,6 +21,12 @@ KVER=$(basename "$KERNEL" | sed 's/^bzImage-//')
 MODTAR="$DIST/modules-${KVER}.tar.gz"
 [ -f "$MODTAR" ] || { echo "找不到 $MODTAR"; exit 1; }
 
+# 镜像名里嵌入提交号，方便追溯"这张盘是哪次提交打出来的"；本地构建留空
+SUFFIX=""
+if [ -n "${GIT_SHA:-}" ]; then
+  SUFFIX="-g$(printf '%s' "$GIT_SHA" | cut -c1-7)"
+fi
+
 echo "==> 内核版本 $KVER, 镜像 ${IMG_MB}MiB"
 rm -rf "$BUILD"; mkdir -p "$BUILD/root" "$OUT"
 
@@ -42,6 +48,8 @@ trap cleanup EXIT
 mkfs.vfat -F32 -n WYSEESP "${LOOP}p1" >/dev/null
 mkfs.ext4 -F -q -L wyse-root "${LOOP}p2"
 ROOT_PARTUUID=$(blkid -s PARTUUID -o value "${LOOP}p2")
+ROOT_FSUUID=$(blkid -s UUID -o value "${LOOP}p2")
+[ -n "$ROOT_PARTUUID" ] && [ -n "$ROOT_FSUUID" ] || { echo "取不到 root 分区 UUID"; exit 1; }
 
 mount "${LOOP}p2" "$BUILD/root"
 mkdir -p "$BUILD/root/boot/efi"
@@ -80,16 +88,22 @@ grub-install --target=x86_64-efi \
   --boot-directory="$BUILD/root/boot" \
   --removable --no-nvram --no-floppy >/dev/null 2>&1
 
-mkdir -p "$BUILD/root/boot/grub"
-sed "s|__ROOT_PARTUUID__|$ROOT_PARTUUID|g" "$REPO/configs/grub.cfg" \
+# --removable 装出来的 BOOTX64.EFI 内嵌 prefix 指向 ESP 上的 /EFI/BOOT，
+# 所以 grub.cfg 必须同时放到 ESP，否则真机上是直接掉进 rescue shell。
+mkdir -p "$BUILD/root/boot/grub" "$BUILD/root/boot/efi/EFI/BOOT"
+sed -e "s|__ROOT_PARTUUID__|$ROOT_PARTUUID|g" \
+    -e "s|__ROOT_FSUUID__|$ROOT_FSUUID|g" "$REPO/configs/grub.cfg" \
   > "$BUILD/root/boot/grub/grub.cfg"
+cp "$BUILD/root/boot/grub/grub.cfg" "$BUILD/root/boot/efi/EFI/BOOT/grub.cfg"
 
+echo "==> 卸载并压缩"
 sync
-umount -R "$BUILD/root"
-losetup -d "$LOOP"
+umount -R "$BUILD/root" 2>/dev/null || true
+losetup -d "$LOOP" 2>/dev/null || true
 trap - EXIT
 
-echo "==> 压缩"
-gzip -1 -c "$IMG" > "$OUT/wyse5070-$KVER.img.gz"
+IMAGE_FILE="$OUT/wyse5070-${KVER}${SUFFIX}.img.gz"
+gzip -1 -c "$IMG" > "$IMAGE_FILE"
 rm -f "$IMG"
 ls -lh "$OUT"
+echo "$IMAGE_FILE"
