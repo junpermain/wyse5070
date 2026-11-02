@@ -63,10 +63,12 @@ tar xzf "$BUILD/alpine.tar.gz" -C "$BUILD/root"
 
 # Alpine 3.24+ 的 minirootfs 不再自带 openrc（inittab 却仍引用 /sbin/openrc），
 # 不补装的话开机卡在 "can't run '/sbin/openrc'"
+# 注意：chroot 里的 DNS 不能照抄宿主机的 resolv.conf（CI runner 上常是 127.0.0.53
+# 这类本地 stub，chroot 内解析不了会一直重试把 job 挂死），这里直接写公共 DNS。
 echo "==> 补装 openrc（新版 minirootfs 已移除）"
-cp -L /etc/resolv.conf "$BUILD/root/etc/resolv.conf" 2>/dev/null || true
-chroot "$BUILD/root" /sbin/apk add --no-cache openrc >/dev/null 2>&1 \
-  || { echo "!! apk add openrc 失败"; exit 1; }
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$BUILD/root/etc/resolv.conf"
+timeout 300 chroot "$BUILD/root" /sbin/apk add --no-cache --no-progress openrc >/dev/null 2>&1 \
+  || { echo "!! apk add openrc 失败（300s 超时或网络不可达）"; exit 1; }
 rm -f "$BUILD/root/etc/resolv.conf"
 [ -e "$BUILD/root/sbin/openrc" ] || { echo "!! openrc 未落位"; exit 1; }
 
