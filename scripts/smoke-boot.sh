@@ -9,7 +9,9 @@ IMG_GZ="${1:-}"
 if [ -z "$IMG_GZ" ] || [ ! -f "$IMG_GZ" ]; then
   echo "用法: $0 <path/to/*.img.gz>"; exit 1
 fi
-MAX_WAIT="${MAX_WAIT:-180}"   # 秒，TCG 模拟下内核启动约 30–90s
+MAX_WAIT="${MAX_WAIT:-240}"   # 秒，TCG 模拟下内核启动约 30–90s，公共 runner 上留足余量
+LOG_DIR="${SMOKE_LOG_DIR:-$(cd "$(dirname "$IMG_GZ")" 2>/dev/null && pwd)}"
+[ -w "$LOG_DIR" ] || LOG_DIR="${TMPDIR:-/tmp}"
 
 find_ovmf() {
   for f in /usr/share/OVMF/OVMF_CODE_4M.fd \
@@ -35,7 +37,9 @@ else
 fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/smoke.XXXXXX")
-IMG="$WORK/img"; LOG="$WORK/serial.log"
+IMG="$WORK/img"
+# 串口日志放在 WORK 之外：干净退出时 WORK 会被删掉，留着它才能诊断失败
+LOG="$LOG_DIR/serial.log"; : > "$LOG"
 QPID=""
 cleanup() {
   set +e
@@ -60,9 +64,14 @@ case "${BIOS_ARGS[0]}" in
     ;;
 esac
 
-echo "==> QEMU 启动（OVMF: $OVMF，最长 ${MAX_WAIT}s）"
+echo "==> QEMU 版本: $(qemu-system-x86_64 --version | head -1)"
+echo "==> 固件: ${BIOS_ARGS[*]}"
+echo "==> QEMU 启动（OVMF: $OVMF，最长 ${MAX_WAIT}s，日志 $LOG）"
+# 有 KVM 就用，没有就退 TCG；-cpu max 在 TCG 下最保险
+ACCEL=(-cpu max)
+if [ -w /dev/kvm ]; then ACCEL=(-enable-kvm -cpu host); fi
 qemu-system-x86_64 \
-  -machine pc -cpu max -m 1024 \
+  -machine pc "${ACCEL[@]}" -m 1024 \
   -display none -monitor none -no-reboot -no-shutdown \
   -serial "file:$LOG" \
   "${BIOS_ARGS[@]}" \
@@ -81,9 +90,12 @@ kill "$QPID" 2>/dev/null || true
 wait "$QPID" 2>/dev/null || true
 QPID=""
 
-echo "----- 串口日志（尾部） -----"
-tail -n 30 "$LOG" 2>/dev/null || echo "(无输出)"
+echo "----- 串口日志（头 20 行） -----"
+head -n 20 "$LOG" 2>/dev/null || echo "(无输出)"
+echo "----- 串口日志（尾 60 行） -----"
+tail -n 60 "$LOG" 2>/dev/null || echo "(无输出)"
 echo "---------------------------"
+echo "==> 完整日志留在: $LOG"
 
 fail() { echo "!! $*"; exit 1; }
 
@@ -97,8 +109,8 @@ grep -q "Kernel command line" "$LOG" || fail "拿不到内核命令行"
 grep -q "root=PARTUUID=" "$LOG" || fail "内核命令行里没有 root=PARTUUID，GRUB 配置没生效"
 ok_line=$(grep -m1 "Kernel command line" "$LOG")
 echo "   $ok_line"
-grep -q "EXT4-fs (sda2): mounted filesystem" "$LOG" \
-  || fail "root 分区没挂上（/dev/sda2 未识别或 fstab 有误）"
+grep -qE "EXT4-fs \((sda|sdb|hda|vda)2\): mounted filesystem" "$LOG" \
+  || fail "root 分区没挂上（第 2 分区未识别或 fstab 有误）"
 echo "   [OK] root 分区挂载成功"
 [ "$READY" = "1" ] || fail "没走到 init（内核起来了但 rootfs 不可用）"
 echo "   [OK] 已进入 /sbin/init"

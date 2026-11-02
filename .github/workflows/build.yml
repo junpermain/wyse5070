@@ -177,13 +177,15 @@ jobs:
           chmod +x scripts/*.sh
           ./scripts/smoke-boot.sh "$(ls out/wyse5070-*.img.gz | head -1)"
 
-      # 启动日志留档，真机不亮时可以直接对照
+      # 启动日志留档，真机不亮时可以直接对照（脚本把它留在 out/ 下，别删）
       - name: 保留串口日志
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: smoke-serial-log
-          path: /tmp/smoke.*/serial.log
+          path: |
+            out/serial.log
+            /tmp/smoke.*/serial.log
           if-no-files-found: ignore
           retention-days: 15
 
