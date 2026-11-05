@@ -32,10 +32,16 @@ rm -rf "$BUILD"; mkdir -p "$BUILD/root" "$OUT"
 
 IMG="$BUILD/wyse5070.img"
 truncate -s "${IMG_MB}M" "$IMG"
+# 双引导布局：p1 ESP(UEFI) / p2 root / p3 bios_grub(Legacy BIOS 的 core.img 嵌入区)
+# root 收在 (IMG_MB-3)MiB，最后留 3MiB 给 BIOS 引导分区；分区编号保持 p1/p2 不变，
+# grub.cfg/fstab 全部动态取 PARTUUID，不受影响
+BIOS_PART_START="$((IMG_MB - 3))MiB"
 parted -s "$IMG" mklabel gpt
 parted -s "$IMG" mkpart ESP fat32 1MiB 257MiB
 parted -s "$IMG" set 1 esp on
-parted -s "$IMG" mkpart root ext4 257MiB 100%
+parted -s "$IMG" mkpart root ext4 257MiB "$BIOS_PART_START"
+parted -s "$IMG" mkpart biosboot "$BIOS_PART_START" 100%
+parted -s "$IMG" set 3 bios_grub on
 
 LOOP=$(losetup -Pf --show "$IMG")
 cleanup() {
@@ -47,6 +53,7 @@ trap cleanup EXIT
 
 mkfs.vfat -F32 -n WYSEESP "${LOOP}p1" >/dev/null
 mkfs.ext4 -F -q -L wyse-root "${LOOP}p2"
+# p3 是 bios_grub 裸分区，不打文件系统
 ROOT_PARTUUID=$(blkid -s PARTUUID -o value "${LOOP}p2")
 ROOT_FSUUID=$(blkid -s UUID -o value "${LOOP}p2")
 [ -n "$ROOT_PARTUUID" ] && [ -n "$ROOT_FSUUID" ] || { echo "取不到 root 分区 UUID"; exit 1; }
@@ -109,6 +116,23 @@ grub-mkstandalone -O x86_64-efi \
   --modules="part_gpt part_msdos ext2 fat linux search search_fs_uuid search_label normal configfile echo test boot gzio all_video" \
   "boot/grub/grub.cfg=$BUILD/root/boot/grub/grub.cfg"
 [ -s "$BUILD/root/boot/efi/EFI/BOOT/BOOTX64.EFI" ] || { echo "!! BOOTX64.EFI 生成失败"; exit 1; }
+
+# BIOS/Legacy 引导：和 EFI 用同一份 grub.cfg（memdisk 内嵌，search --fs-uuid 找 root）。
+# MBR 前 446 字节写 boot.img（保护 MBR 的分区表区域原样保留），
+# core.img 嵌进 p3 bios_grub 分区 —— 纯 BIOS 老机器（J1900 这类）不用换固件也能起。
+echo "==> 生成 BIOS/Legacy 引导 (boot.img + core.img)"
+mkdir -p "$BUILD/memdisk/boot/grub"
+cp "$BUILD/root/boot/grub/grub.cfg" "$BUILD/memdisk/boot/grub/grub.cfg"
+tar -C "$BUILD/memdisk" -cf "$BUILD/memdisk.tar" boot
+grub-mkimage -O i386-pc -o "$BUILD/core.img" -p '(memdisk)/boot/grub' \
+  --modules="part_gpt part_msdos ext2 fat linux search search_fs_uuid search_label normal configfile echo test boot gzio all_video memdisk tar" \
+  "$BUILD/memdisk.tar"
+[ -s "$BUILD/core.img" ] || { echo "!! BIOS core.img 生成失败"; exit 1; }
+CORE_SIZE=$(stat -c%s "$BUILD/core.img")
+[ "$CORE_SIZE" -lt $((3 * 1024 * 1024)) ] || { echo "!! core.img ($CORE_SIZE B) 超过 bios_grub 分区容量 3MiB"; exit 1; }
+dd if=/usr/lib/grub/i386-pc/boot.img of="$IMG" bs=446 count=1 conv=notrunc status=none
+dd if="$BUILD/core.img" of="${LOOP}p3" conv=notrunc status=none
+sync
 
 echo "==> 卸载并压缩"
 sync

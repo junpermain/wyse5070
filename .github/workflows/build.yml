@@ -112,7 +112,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             e2fsprogs dosfstools parted mtools util-linux \
-            grub-efi-amd64-bin grub-common gzip
+            grub-efi-amd64-bin grub-pc-bin grub-common gzip
 
       - name: 生成镜像
         env:
@@ -122,7 +122,7 @@ jobs:
           # 用 env 显式带过去，避免 sudo 的 env_reset 把 GIT_SHA 吃掉
           sudo env GIT_SHA="$GIT_SHA" ./scripts/build-image.sh
 
-      - name: 结构自检（gzip / ESP / PARTUUID / 模块 / rootfs）
+      - name: 结构自检（gzip / 双引导 / ESP / PARTUUID / 模块 / rootfs）
         env:
           KVER: ${{ needs.kernel.outputs.kver }}
         run: |
@@ -145,6 +145,7 @@ jobs:
             echo "| 项目 | 值 |"
             echo "|---|---|"
             echo "| 内核 | \`${{ needs.kernel.outputs.kver }}\` |"
+            echo "| 引导 | UEFI + Legacy BIOS 混合 |"
             echo "| 提交 | \`${{ needs.kernel.outputs.sha }}\` |"
             echo "| 镜像 | \`$(basename "$f")\` |"
             echo "| 大小 | $(du -h "$f" | cut -f1) |"
@@ -168,9 +169,9 @@ jobs:
       - name: 安装 QEMU 与 UEFI 固件
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf gzip
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf grub-pc-bin gzip
 
-      - name: 引导一次，确认能进 init
+      - name: QEMU 双引导冒烟（UEFI + Legacy BIOS）
         env:
           KVER: ${{ needs.kernel.outputs.kver }}
         run: |
@@ -184,8 +185,9 @@ jobs:
         with:
           name: smoke-serial-log
           path: |
-            out/serial.log
-            /tmp/smoke.*/serial.log
+            out/serial-uefi.log
+            out/serial-bios.log
+            /tmp/smoke.*/serial*.log
           if-no-files-found: ignore
           retention-days: 15
 

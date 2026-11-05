@@ -22,11 +22,11 @@ trap cleanup EXIT
 fail() { echo "!! $*"; exit 1; }
 ok()   { echo "   [OK] $*"; }
 
-echo "==> 1/6 gzip 完整性"
+echo "==> 1/7 gzip 完整性"
 gzip -t "$IMG_GZ" || fail "gzip 校验失败，压缩包是坏的"
 ok "gzip -t 通过（$(du -h "$IMG_GZ" | cut -f1)）"
 
-echo "==> 2/6 挂载分区"
+echo "==> 2/7 挂载分区"
 IMG="$WORK/img"
 zcat "$IMG_GZ" > "$IMG"
 LOOP=$(losetup -Pf --show "$IMG") || fail "losetup 失败"
@@ -35,7 +35,7 @@ mount "${LOOP}p2" "$ROOT" || fail "root 分区挂不上"
 mount "${LOOP}p1" "$ESP"  || fail "ESP 挂不上"
 ok "两个分区都能挂载"
 
-echo "==> 3/6 UEFI 引导文件"
+echo "==> 3/7 UEFI 引导文件"
 [ -f "$ESP/EFI/BOOT/BOOTX64.EFI" ] \
   || fail "ESP 缺 EFI/BOOT/BOOTX64.EFI —— 真机根本不会引导"
 ok "EFI/BOOT/BOOTX64.EFI"
@@ -44,7 +44,18 @@ ok "EFI/BOOT/BOOTX64.EFI"
   || fail "ESP 缺 EFI/BOOT/grub.cfg —— --removable 模式下 GRUB 只认这个位置"
 ok "EFI/BOOT/grub.cfg"
 
-echo "==> 4/6 PARTUUID / UUID 一致性"
+echo "==> 4/7 双引导（Legacy BIOS）"
+parted -ms "$IMG" print 2>/dev/null | grep -q bios_grub \
+  || fail "GPT 上没有 bios_grub 分区 —— Legacy BIOS 机器起不来"
+ok "GPT bios_grub 分区在位"
+dd if="$IMG" bs=446 count=1 status=none | grep -aq GRUB \
+  || fail "MBR 前 446 字节没有 boot.img"
+ok "MBR boot.img 已写入"
+dd if="${LOOP}p3" bs=512 count=1 status=none 2>/dev/null | grep -aq GRUB \
+  || fail "bios_grub 分区里没有 core.img"
+ok "bios_grub 分区 core.img 在位"
+
+echo "==> 5/7 PARTUUID / UUID 一致性"
 PU=$(blkid -s PARTUUID -o value "${LOOP}p2")
 FU=$(blkid -s UUID -o value "${LOOP}p2")
 [ -n "$PU" ] && [ -n "$FU" ] || fail "取不到 root 分区标识"
@@ -57,7 +68,7 @@ fi
 ok "PARTUUID=$PU  grub.cfg 与 fstab 一致"
 ok "fs-uuid=$FU  search 指令在位"
 
-echo "==> 5/6 内核与模块"
+echo "==> 6/7 内核与模块"
 [ -f "$ROOT/boot/vmlinuz-wyse5070" ] || fail "缺 /boot/vmlinuz-wyse5070"
 ok "内核 $(du -h "$ROOT/boot/vmlinuz-wyse5070" | cut -f1)"
 MODDIR=$(ls -d "$ROOT"/lib/modules/*/ 2>/dev/null | head -1 || true)
@@ -70,7 +81,7 @@ if [ -n "${KVER:-}" ]; then
   case "$(basename "$MODDIR")" in "$KVER") ok "版本与期望一致 $KVER" ;; *) fail "模块版本 $(basename "$MODDIR") ≠ 期望 $KVER" ;; esac
 fi
 
-echo "==> 6/6 用户空间"
+echo "==> 7/7 用户空间"
 { [ -f "$ROOT/usr/bin/apk" ] || [ -f "$ROOT/sbin/apk" ]; } || fail "没有 apk，rootfs 不是 Alpine"
 [ -e "$ROOT/sbin/init" ]          || fail "没有 /sbin/init，起不来"
 [ -f "$ROOT/root/setup/alpine-setup.sh" ] || fail "缺首启脚本 /root/setup/alpine-setup.sh"
