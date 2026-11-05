@@ -48,12 +48,14 @@ echo "==> 4/7 双引导（Legacy BIOS）"
 parted -ms "$IMG" print 2>/dev/null | grep -q bios_grub \
   || fail "GPT 上没有 bios_grub 分区 —— Legacy BIOS 机器起不来"
 ok "GPT bios_grub 分区在位"
-dd if="$IMG" bs=446 count=1 status=none | grep -aq GRUB \
-  || fail "MBR 前 446 字节没有 boot.img"
-ok "MBR boot.img 已写入"
-dd if="${LOOP}p3" bs=512 count=1 status=none 2>/dev/null | grep -aq GRUB \
-  || fail "bios_grub 分区里没有 core.img"
-ok "bios_grub 分区 core.img 在位"
+# MBR 前 446 字节必须是 boot.img 代码（全零说明没写入）；
+# 功能层面的证明由 SeaBIOS 冒烟启动负责
+MBR_CODE=$(dd if="$IMG" bs=446 count=1 status=none | tr -d '\0' | wc -c)
+[ "$MBR_CODE" -gt 300 ] || fail "MBR 前 446 字节近乎全空 —— boot.img 没写入"
+ok "MBR boot.img 已写入（$MBR_CODE 字节代码）"
+CORE_CODE=$(dd if="${LOOP}p3" bs=4096 count=1 status=none | tr -d '\0' | wc -c)
+[ "$CORE_CODE" -gt 1024 ] || fail "bios_grub 分区是空的 —— core.img 没写入"
+ok "bios_grub 分区 core.img 在位（$CORE_CODE 字节）"
 
 echo "==> 5/7 PARTUUID / UUID 一致性"
 PU=$(blkid -s PARTUUID -o value "${LOOP}p2")

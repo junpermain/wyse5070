@@ -117,16 +117,15 @@ grub-mkstandalone -O x86_64-efi \
   "boot/grub/grub.cfg=$BUILD/root/boot/grub/grub.cfg"
 [ -s "$BUILD/root/boot/efi/EFI/BOOT/BOOTX64.EFI" ] || { echo "!! BOOTX64.EFI 生成失败"; exit 1; }
 
-# BIOS/Legacy 引导：和 EFI 用同一份 grub.cfg（memdisk 内嵌，search --fs-uuid 找 root）。
+# BIOS/Legacy 引导：和 EFI 用同一份 grub.cfg（mkstandalone 内嵌 memdisk，search --fs-uuid 找 root）。
 # MBR 前 446 字节写 boot.img（保护 MBR 的分区表区域原样保留），
 # core.img 嵌进 p3 bios_grub 分区 —— 纯 BIOS 老机器（J1900 这类）不用换固件也能起。
+# 注意：i386-pc 输出就是 core.img（boot.img 独立文件，不拼在前面）
 echo "==> 生成 BIOS/Legacy 引导 (boot.img + core.img)"
-mkdir -p "$BUILD/memdisk/boot/grub"
-cp "$BUILD/root/boot/grub/grub.cfg" "$BUILD/memdisk/boot/grub/grub.cfg"
-tar -C "$BUILD/memdisk" -cf "$BUILD/memdisk.tar" boot
-grub-mkimage -O i386-pc -o "$BUILD/core.img" -p '(memdisk)/boot/grub' \
-  --modules="part_gpt part_msdos ext2 fat linux search search_fs_uuid search_label normal configfile echo test boot gzio all_video memdisk tar" \
-  "$BUILD/memdisk.tar"
+grub-mkstandalone -O i386-pc \
+  -o "$BUILD/core.img" \
+  --modules="part_gpt part_msdos ext2 fat linux search search_fs_uuid search_label normal configfile echo test boot gzio all_video" \
+  "boot/grub/grub.cfg=$BUILD/root/boot/grub/grub.cfg"
 [ -s "$BUILD/core.img" ] || { echo "!! BIOS core.img 生成失败"; exit 1; }
 CORE_SIZE=$(stat -c%s "$BUILD/core.img")
 [ "$CORE_SIZE" -lt $((3 * 1024 * 1024)) ] || { echo "!! core.img ($CORE_SIZE B) 超过 bios_grub 分区容量 3MiB"; exit 1; }
