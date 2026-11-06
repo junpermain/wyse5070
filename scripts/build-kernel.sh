@@ -73,7 +73,7 @@ echo "==> 编译 bzImage + 模块 (-j$JOBS)"
 MAKE_ARGS=()
 if [ "${CCACHE:-0}" = "1" ]; then
   command -v ccache >/dev/null || { echo "!! 要求 CCACHE=1 但没装 ccache"; exit 1; }
-  ccache -M 2G >/dev/null 2>&1 || true
+  : # 保留全局 30G 上限
   ccache -z >/dev/null 2>&1 || true
   MAKE_ARGS=("CC=ccache gcc" "HOSTCC=ccache gcc")
   echo "    ccache 已启用"

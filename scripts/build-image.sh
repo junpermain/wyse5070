@@ -13,7 +13,13 @@ DIST="$REPO/dist"
 OUT="$REPO/out"
 BUILD="$REPO/build/image"
 IMG_MB="${IMG_MB:-2560}"
-ALPINE_BASE="${ALPINE_BASE:-https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64}"
+# Alpine 源：默认走阿里云镜像。dl-cdn.alpinelinux.org 在国内常出现
+# "OpenSSL SSL_read: unexpected eof" 之类的中途断流，重试也未必能过。
+# 国外环境可用 ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine 覆盖。
+ALPINE_MIRROR="${ALPINE_MIRROR:-https://mirrors.aliyun.com/alpine}"
+ALPINE_BASE="${ALPINE_BASE:-$ALPINE_MIRROR/latest-stable/releases/x86_64}"
+APK_MIRROR="${APK_MIRROR:-$ALPINE_MIRROR}"
+DNS_SERVERS="${DNS_SERVERS:-223.5.5.5 119.29.29.29}"
 
 KERNEL=$(ls "$DIST"/bzImage-* 2>/dev/null | head -1 || true)
 [ -n "$KERNEL" ] || { echo "找不到 $DIST/bzImage-*"; exit 1; }
@@ -63,17 +69,24 @@ mkdir -p "$BUILD/root/boot/efi"
 mount "${LOOP}p1" "$BUILD/root/boot/efi"
 
 echo "==> 下载 Alpine minirootfs"
-FILE=$(curl -fsSL "$ALPINE_BASE/latest-releases.yaml" \
+FILE=$(curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors "$ALPINE_BASE/latest-releases.yaml" \
        | grep -m1 'file: alpine-minirootfs' | awk '{print $2}')
-curl -fL --retry 3 -o "$BUILD/alpine.tar.gz" "$ALPINE_BASE/$FILE"
+[ -n "$FILE" ] || { echo "!! 取不到 minirootfs 文件名（源: $ALPINE_BASE）"; exit 1; }
+echo "    $FILE"
+curl -fL --retry 5 --retry-delay 2 --retry-all-errors -o "$BUILD/alpine.tar.gz" "$ALPINE_BASE/$FILE"
 tar xzf "$BUILD/alpine.tar.gz" -C "$BUILD/root"
 
 # Alpine 3.24+ 的 minirootfs 不再自带 openrc（inittab 却仍引用 /sbin/openrc），
 # 不补装的话开机卡在 "can't run '/sbin/openrc'"
-# 注意：chroot 里的 DNS 不能照抄宿主机的 resolv.conf（CI runner 上常是 127.0.0.53
-# 这类本地 stub，chroot 内解析不了会一直重试把 job 挂死），这里直接写公共 DNS。
+# chroot 内的 DNS 与 apk 源都要单独配：宿主机的 resolv.conf 常是 127.0.0.53 这类
+# 本地 stub，chroot 里解析不了会一直重试把 job 挂死；源也换成镜像站，避免断流。
 echo "==> 补装 openrc（新版 minirootfs 已移除）"
-printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$BUILD/root/etc/resolv.conf"
+printf 'nameserver %s\n' $DNS_SERVERS > "$BUILD/root/etc/resolv.conf"
+mkdir -p "$BUILD/root/etc/apk"
+cat > "$BUILD/root/etc/apk/repositories" <<EOF
+$APK_MIRROR/latest-stable/main
+$APK_MIRROR/latest-stable/community
+EOF
 timeout 300 chroot "$BUILD/root" /sbin/apk add --no-cache --no-progress openrc >/dev/null 2>&1 \
   || { echo "!! apk add openrc 失败（300s 超时或网络不可达）"; exit 1; }
 rm -f "$BUILD/root/etc/resolv.conf"
@@ -113,24 +126,35 @@ cp "$BUILD/root/boot/grub/grub.cfg" "$BUILD/root/boot/efi/EFI/BOOT/grub.cfg"
 echo "==> 生成独立 GRUB EFI (grub-mkstandalone)"
 grub-mkstandalone -O x86_64-efi \
   -o "$BUILD/root/boot/efi/EFI/BOOT/BOOTX64.EFI" \
-  --modules="part_gpt part_msdos ext2 fat linux search search_fs_uuid search_label normal configfile echo test boot gzio all_video" \
+  --modules="part_gpt part_msdos ext2 fat linux search search_fs_uuid search_label normal configfile echo test boot gzio all_video serial" \
   "boot/grub/grub.cfg=$BUILD/root/boot/grub/grub.cfg"
 [ -s "$BUILD/root/boot/efi/EFI/BOOT/BOOTX64.EFI" ] || { echo "!! BOOTX64.EFI 生成失败"; exit 1; }
 
-# BIOS/Legacy 引导：和 EFI 用同一份 grub.cfg（mkstandalone 内嵌 memdisk，search --fs-uuid 找 root）。
-# MBR 前 446 字节写 boot.img（保护 MBR 的分区表区域原样保留），
-# core.img 嵌进 p3 bios_grub 分区 —— 纯 BIOS 老机器（J1900 这类）不用换固件也能起。
-# 注意：i386-pc 输出就是 core.img（boot.img 独立文件，不拼在前面）
-echo "==> 生成 BIOS/Legacy 引导 (boot.img + core.img)"
-grub-mkstandalone -O i386-pc \
-  -o "$BUILD/core.img" \
-  --modules="part_gpt part_msdos ext2 fat linux search search_fs_uuid search_label normal configfile echo test boot gzio all_video" \
-  "boot/grub/grub.cfg=$BUILD/root/boot/grub/grub.cfg"
-[ -s "$BUILD/core.img" ] || { echo "!! BIOS core.img 生成失败"; exit 1; }
-CORE_SIZE=$(stat -c%s "$BUILD/core.img")
-[ "$CORE_SIZE" -lt $((3 * 1024 * 1024)) ] || { echo "!! core.img ($CORE_SIZE B) 超过 bios_grub 分区容量 3MiB"; exit 1; }
-dd if=/usr/lib/grub/i386-pc/boot.img of="$IMG" bs=446 count=1 conv=notrunc status=none
-dd if="$BUILD/core.img" of="${LOOP}p3" conv=notrunc status=none
+# BIOS/Legacy 引导。
+# 不能用 grub-mkstandalone：它把 grub.cfg 以 memdisk 形式整个内嵌，i386-pc 的
+# core.img 编译完约 3MB，直接撞上 "核心镜像过大 (0x2f8d73 > 0x78000)" 的硬上限
+# （i386-pc 的 core 只能占 480KiB，这块空间要挤在 MBR 之后）。
+# 标准做法：grub-mkimage 生成不含配置的 core.img，prefix 指向 root 分区上的
+# /boot/grub，再用 grub-bios-setup 写 MBR（保留分区表）+ bios_grub 分区，
+# 并回填 core.img 的真实起始 LBA——手工 dd 是补不上这个 LBA 的，只会读到错位置。
+echo "==> 生成 BIOS/Legacy 引导 (core.img + grub-bios-setup)"
+BIOS_DIR="$BUILD/bios"
+mkdir -p "$BIOS_DIR"
+grub-mkimage -O i386-pc -o "$BIOS_DIR/core.img" \
+  -p '(hd0,gpt2)/boot/grub' \
+  biosdisk part_gpt part_msdos ext2 fat linux search search_fs_uuid search_label normal configfile echo test boot gzio all_video serial
+[ -s "$BIOS_DIR/core.img" ] || { echo "!! BIOS core.img 生成失败"; exit 1; }
+CORE_SIZE=$(stat -c%s "$BIOS_DIR/core.img")
+echo "    core.img $CORE_SIZE 字节（上限 480KiB）"
+[ "$CORE_SIZE" -lt $((480 * 1024)) ] || { echo "!! core.img ($CORE_SIZE B) 超过 i386-pc 的 480KiB 上限"; exit 1; }
+echo "(hd0) $LOOP" > "$BIOS_DIR/device.map"
+# Debian/Ubuntu 把 grub-bios-setup 装在 /usr/lib/grub/i386-pc 下（不进 PATH），
+# 上游/Gentoo 则是 /usr/sbin，两处都探一下
+GRUB_BIOS_SETUP=$(command -v grub-bios-setup 2>/dev/null || true)
+[ -n "$GRUB_BIOS_SETUP" ] || GRUB_BIOS_SETUP=/usr/lib/grub/i386-pc/grub-bios-setup
+[ -x "$GRUB_BIOS_SETUP" ] || { echo "!! 找不到 grub-bios-setup（需 grub-pc-bin）"; exit 1; }
+cp -f /usr/lib/grub/i386-pc/boot.img "$BIOS_DIR/boot.img"
+"$GRUB_BIOS_SETUP" -d "$BIOS_DIR" -m "$BIOS_DIR/device.map" "$LOOP"
 sync
 
 echo "==> 卸载并压缩"
